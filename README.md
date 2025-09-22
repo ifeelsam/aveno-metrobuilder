@@ -15,13 +15,13 @@ bun dev
 bun start
 ```
 
-Server runs on `http://localhost:3000`
+Server runs on `http://localhost:4836`
 
 ## Usage
 
 Deploy a GitHub repository:
 ```bash
-curl -X POST http://localhost:3000/build \
+curl -X POST http://localhost:4836/build \
   -H "Content-Type: application/json" \
   -d '{"githubUrl": "https://github.com/username/repo"}'
 ```

@@ -246,13 +246,13 @@ async function cleanupBuild(buildId: string): Promise<void> {
 }
 
 Bun.serve({
-  port: 3000,
+  port: 4836,
   routes: {
     "/": (req) => {
       log('info', 'Health check endpoint accessed', { method: req.method, url: req.url });
       
       return new Response(JSON.stringify({
-        message: "Aveno Backend - GitHub Builder Service",
+        message: "Aveno MetroBuilder - On-chain deployment platform",
         endpoints: {
           "POST /build": "Build and publish a GitHub repository"
         }
@@ -370,9 +370,9 @@ Bun.serve({
   }
 });
 
-log('info', '🚀 Aveno Backend server started successfully', { 
-  port: 3000, 
+log('info', '🚀 Aveno MetroBuilder server started successfully', { 
+  port: 4836, 
   endpoints: ['/build (POST)', '/ (GET)']
 });
 
-console.log("🚀 Aveno Backend server running on http://localhost:3000");
+console.log("🚀 Aveno MetroBuilder server running on http://localhost:4836");
