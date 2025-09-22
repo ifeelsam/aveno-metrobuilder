@@ -1,15 +1,63 @@
-# aveno-backend
+# Aveno MetroBuilder
 
-To install dependencies:
+Minimal on-chain deployment platform that builds GitHub repositories and publishes them using site-builder.
+
+## Quick Start
 
 ```bash
+# Install dependencies
 bun install
+
+# Start development server
+bun dev
+
+# Or start production server
+bun start
 ```
 
-To run:
+Server runs on `http://localhost:3000`
 
+## Usage
+
+Deploy a GitHub repository:
 ```bash
-bun run src/index.ts
+curl -X POST http://localhost:3000/build \
+  -H "Content-Type: application/json" \
+  -d '{"githubUrl": "https://github.com/username/repo"}'
 ```
 
-This project was created using `bun init` in bun v1.2.18. [Bun](https://bun.sh) is a fast all-in-one JavaScript runtime.
+## File Structure
+
+```
+aveno-metrobuilder/
+├── src/
+│   └── index.ts          # Main server & build logic
+├── sites-config.yaml     # Site-builder configuration
+├── package.json          # Project dependencies
+└── README.md             # This file
+```
+
+## How Builds Work
+
+1. **Clone** GitHub repo to temporary `./builds/{buildId}/` directory
+2. **Install** dependencies with `bun install`
+3. **Build** project with `bun run build`
+4. **Export** static files (for Next.js projects)
+5. **Detect** output directory (`out`, `dist`, `build`, `.next`)
+6. **Publish** to chain using `site-builder --config sites-config.yaml publish --epochs 1 {dist-path}`
+7. **Cleanup** temporary build directory
+
+## Build Output Detection
+
+MetroBuilder automatically detects build outputs in this order:
+- `out/` (Next.js static export)
+- `dist/` (Vite, Webpack, etc.)
+- `build/` (Create React App, etc.)
+- `.next/standalone/` (Next.js standalone)
+- `.next/` (Next.js fallback)
+
+## Requirements
+
+- Bun runtime
+- site-builder CLI tool
+- Git
