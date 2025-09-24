@@ -2,6 +2,12 @@
 
 Minimal on-chain deployment platform that builds GitHub repositories and publishes them using site-builder.
 
+Environment variables to enable Nginx portal mapping (optional):
+
+- AVENO_DOMAIN_BASE: base domain for public mapping (default: avenox.xyz)
+- AVENO_PORTAL_MAP_PATH: path to Nginx map file (default: /var/lib/avenox/portal.map)
+- AVENO_NGINX_RELOAD: set to "1" or "true" to run `sudo nginx -t` and `sudo systemctl reload nginx` after updating the map
+
 ## Quick Start
 
 ```bash

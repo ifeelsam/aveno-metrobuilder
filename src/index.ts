@@ -1,4 +1,6 @@
 import { spawn } from "bun";
+import * as fs from "fs/promises";
+import { dirname } from "path";
 
 // Logging utility
 function log(level: string, message: string, data?: any) {
@@ -13,13 +15,138 @@ interface BuildResponse {
   success: boolean;
   message: string;
   buildId?: string;
+  portalUrl?: string;      // e.g. http://<slug>.localhost:3000
+  publicHost?: string;     // e.g. <repo>.avenox.xyz
+  publicUrl?: string;      // e.g. http(s)://<repo>.avenox.xyz
 }
+
+// Configuration via environment variables
+const DOMAIN_BASE = process.env.AVENO_DOMAIN_BASE || "avenox.xyz";
+const PORTAL_MAP_PATH = process.env.AVENO_PORTAL_MAP_PATH || "/var/lib/avenox/portal.map";
+const NGINX_RELOAD = process.env.AVENO_NGINX_RELOAD === "1" || process.env.AVENO_NGINX_RELOAD === "true";
 
 // Generate unique build ID
 function generateBuildId(): string {
   const buildId = `build_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   log('info', 'Generated new build ID', { buildId });
   return buildId;
+}
+
+// Convert a string into a DNS-safe subdomain
+function toSubdomain(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$|\./g, "");
+}
+
+// Extract repo name from GitHub URL (supports HTTPS and SSH formats)
+function extractRepoNameFromGitHubUrl(githubUrl: string): string | null {
+  try {
+    // Handle HTTPS-like URLs
+    if (githubUrl.startsWith("http://") || githubUrl.startsWith("https://")) {
+      const u = new URL(githubUrl);
+      const parts = u.pathname.split("/").filter(Boolean);
+      const repoRaw = parts[parts.length - 1] || "";
+      return repoRaw.replace(/\.git$/i, "");
+    }
+    // Handle SSH like git@github.com:org/repo.git
+    const match = githubUrl.match(/^[^:]+:([^/]+)\/(.+?)(?:\.git)?$/);
+    if (match) {
+      const repoRaw = match[2];
+      return repoRaw.replace(/\.git$/i, "");
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+// Parse portal URL from site-builder output
+function parsePortalUrlFromOutput(output: string): string | null {
+  // Prefer full URLs first
+  const fullUrl = output.match(/https?:\/\/([a-z0-9-]+)\.localhost:3000[^\s"'\)\]]*/i);
+  if (fullUrl) return fullUrl[0];
+  // Fallback: bare host:port
+  const bareHost = output.match(/([a-z0-9-]+)\.localhost:3000[^\s"'\)\]]*/i);
+  if (bareHost) return `http://${bareHost[0]}`;
+  return null;
+}
+
+async function ensureDirExistsForFile(filePath: string): Promise<void> {
+  try {
+    await fs.mkdir(dirname(filePath), { recursive: true });
+  } catch (error) {
+    // ignore EEXIST etc.
+  }
+}
+
+async function readTextStream(stream: ReadableStream | null | undefined): Promise<string> {
+  if (!stream) return "";
+  // Bun supports Response on ReadableStream for easy text gathering
+  try {
+    return await new Response(stream).text();
+  } catch {
+    return "";
+  }
+}
+
+async function reloadNginxIfEnabled(): Promise<void> {
+  if (!NGINX_RELOAD) return;
+  try {
+    log('info', 'Reloading Nginx as per AVENO_NGINX_RELOAD');
+    const testProc = spawn(["sudo", "nginx", "-t"], { stdio: ["inherit", "inherit", "inherit"] });
+    const testExit = await testProc.exited;
+    if (testExit !== 0) {
+      log('error', 'nginx -t failed; skipping reload', { testExit });
+      return;
+    }
+    const reloadProc = spawn(["sudo", "systemctl", "reload", "nginx"], { stdio: ["inherit", "inherit", "inherit"] });
+    const reloadExit = await reloadProc.exited;
+    if (reloadExit !== 0) {
+      log('error', 'systemctl reload nginx failed', { reloadExit });
+    } else {
+      log('info', 'Nginx reloaded');
+    }
+  } catch (error) {
+    log('error', 'Failed to reload Nginx', { error: error instanceof Error ? error.message : error });
+  }
+}
+
+// Update /var/lib/avenox/portal.map with mapping: <repo>.<domainBase> <slug>.localhost;
+async function registerPortalMapping(repoName: string, portalUrl: string): Promise<{ publicHost: string; portalHost: string; publicUrl: string }> {
+  const repoSubdomain = toSubdomain(repoName);
+  if (!repoSubdomain) {
+    throw new Error("Invalid repo name after slugify");
+  }
+  const publicHost = `${repoSubdomain}.${DOMAIN_BASE}`;
+
+  const u = new URL(portalUrl);
+  if (u.hostname.endsWith('.localhost') === false || (u.port && u.port !== '3000')) {
+    throw new Error(`Unexpected portal URL host/port: ${u.hostname}:${u.port || ''}`);
+  }
+  const portalHost = u.hostname; // e.g. <slug>.localhost
+
+  const publicUrl = `http://${publicHost}`;
+
+  await ensureDirExistsForFile(PORTAL_MAP_PATH);
+
+  // Read existing map file (if any)
+  const current = await fs.readFile(PORTAL_MAP_PATH).then(b => b.toString('utf8')).catch(() => '');
+  const existingLines = current.split('\n').filter(line => line.trim().length > 0);
+  const filtered = existingLines.filter(line => !line.trimStart().startsWith(publicHost + ' '));
+  const updated = [...filtered, `${publicHost} ${portalHost};`].join('\n') + '\n';
+
+  // Atomic replace: write to temp in same dir then rename
+  const tmpPath = `${PORTAL_MAP_PATH}.tmp-${Date.now()}`;
+  await fs.writeFile(tmpPath, updated, { encoding: 'utf8' });
+  await fs.rename(tmpPath, PORTAL_MAP_PATH);
+
+  await reloadNginxIfEnabled();
+
+  log('info', 'Registered portal mapping', { publicHost, portalHost, mapPath: PORTAL_MAP_PATH });
+  return { publicHost, portalHost, publicUrl };
 }
 
 // Clone GitHub repository
@@ -141,7 +268,7 @@ async function buildRepository(buildId: string): Promise<boolean> {
 }
 
 // Publish using site-builder
-async function publishSite(buildId: string): Promise<boolean> {
+async function publishSite(buildId: string): Promise<{ ok: boolean; portalUrl?: string }> {
   const buildDir = `./builds/${buildId}`;
   
   // Find the actual dist folder - check common build outputs including Next.js
@@ -203,23 +330,30 @@ async function publishSite(buildId: string): Promise<boolean> {
     
     const publishProcess = spawn(siteBuilderCommand, {
       cwd: buildDir,
-      stdio: ["inherit", "inherit", "inherit"] // Show all output
+      stdio: ["inherit", "pipe", "pipe"] // capture stdout/stderr to parse portal URL
     });
 
     log('info', 'Site-builder process spawned, waiting for completion...');
     
-    const exitCode = await publishProcess.exited;
+    // Read outputs while process runs
+    const [stdoutText, stderrText, exitCode] = await Promise.all([
+      readTextStream((publishProcess as any).stdout),
+      readTextStream((publishProcess as any).stderr),
+      publishProcess.exited
+    ]);
     
     if (exitCode === 0) {
-      log('info', 'Site published successfully', { exitCode, distPath });
-      return true;
+      const combined = `${stdoutText}\n${stderrText}`;
+      const portalUrl = parsePortalUrlFromOutput(combined) || undefined;
+      log('info', 'Site published successfully', { exitCode, distPath, portalUrl });
+      return { ok: true, portalUrl };
     } else {
-      log('error', 'Site publication failed', { exitCode, distPath });
-      return false;
+      log('error', 'Site publication failed', { exitCode, distPath, stderr: (stderrText || '').slice(-1000) });
+      return { ok: false };
     }
   } catch (error) {
     log('error', 'Error during site publication', { error: error instanceof Error ? error.message : error });
-    return false;
+    return { ok: false };
   }
 }
 
@@ -326,8 +460,8 @@ Bun.serve({
 
         // Step 3: Publish site
         log('info', 'STEP 3: Publishing site with site-builder');
-        const published = await publishSite(buildId);
-        if (!published) {
+        const publishResult = await publishSite(buildId);
+        if (!publishResult.ok) {
           log('error', 'Build failed at publish step, starting cleanup', { buildId });
           await cleanupBuild(buildId);
           return new Response(JSON.stringify({ 
@@ -343,10 +477,33 @@ Bun.serve({
         log('info', 'STEP 4: Cleaning up build directory');
         await cleanupBuild(buildId);
 
+        // Try to map <repo>.<domain> -> <slug>.localhost via Nginx map
+        let publicHost: string | undefined;
+        let publicUrl: string | undefined;
+        let portalUrl: string | undefined = publishResult.portalUrl;
+
+        try {
+          const repoNameExtracted = extractRepoNameFromGitHubUrl(githubUrl);
+          if (!repoNameExtracted) {
+            log('warn', 'Could not extract repo name from GitHub URL; skipping portal map registration', { githubUrl });
+          } else if (!portalUrl) {
+            log('warn', 'No portal URL found in site-builder output; skipping portal map registration');
+          } else {
+            const reg = await registerPortalMapping(repoNameExtracted, portalUrl);
+            publicHost = reg.publicHost;
+            publicUrl = reg.publicUrl;
+          }
+        } catch (e) {
+          log('error', 'Failed to register portal mapping', { error: e instanceof Error ? e.message : e });
+        }
+
         const response: BuildResponse = {
           success: true,
           message: "Successfully built and published site",
-          buildId
+          buildId,
+          portalUrl,
+          publicHost,
+          publicUrl
         };
 
         log('info', 'Build process completed successfully', response);
