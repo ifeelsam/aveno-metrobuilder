@@ -24,6 +24,7 @@ interface BuildResponse {
 const DOMAIN_BASE = process.env.AVENO_DOMAIN_BASE || "avenox.xyz";
 const PORTAL_MAP_PATH = process.env.AVENO_PORTAL_MAP_PATH || "/etc/nginx/portal.map";
 const NGINX_RELOAD = process.env.AVENO_NGINX_RELOAD === "1" || process.env.AVENO_NGINX_RELOAD === "true";
+const CORS_ORIGINS = process.env.AVENO_CORS_ORIGINS || "*"; // comma-separated or '*'
 
 // Generate unique build ID
 function generateBuildId(): string {
@@ -112,6 +113,39 @@ async function reloadNginxIfEnabled(force: boolean = false): Promise<void> {
   } catch (error) {
     log('error', 'Failed to reload Nginx', { error: error instanceof Error ? error.message : error });
   }
+}
+
+// CORS helpers
+function getCorsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("Origin");
+  const allowHeaders = req.headers.get("Access-Control-Request-Headers") || "Content-Type, Authorization";
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": allowHeaders,
+    "Access-Control-Max-Age": "86400",
+  };
+  if (CORS_ORIGINS === "*") {
+    headers["Access-Control-Allow-Origin"] = "*";
+  } else if (origin) {
+    const allowed = CORS_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+    if (allowed.includes(origin)) {
+      headers["Access-Control-Allow-Origin"] = origin;
+      headers["Vary"] = "Origin";
+    }
+  }
+  return headers;
+}
+
+function jsonResponse(req: Request, body: any, status = 200): Response {
+  const baseHeaders = {
+    "Content-Type": "application/json",
+    ...getCorsHeaders(req),
+  };
+  return new Response(JSON.stringify(body), { status, headers: baseHeaders });
+}
+
+function preflightResponse(req: Request): Response {
+  return new Response(null, { status: 204, headers: getCorsHeaders(req) });
 }
 
 // Update /var/lib/avenox/portal.map with mapping: <repo>.<domainBase> <slug>.localhost;
@@ -381,30 +415,27 @@ Bun.serve({
   port: 4836,
   routes: {
     "/": (req) => {
+      if (req.method === "OPTIONS") return preflightResponse(req);
       log('info', 'Health check endpoint accessed', { method: req.method, url: req.url });
       
-      return new Response(JSON.stringify({
+      return jsonResponse(req, {
         message: "Aveno MetroBuilder - On-chain deployment platform",
         endpoints: {
           "POST /build": "Build and publish a GitHub repository"
         }
-      }), {
-        headers: { "Content-Type": "application/json" }
       });
     },
     
     "/build": async (req) => {
+      if (req.method === "OPTIONS") return preflightResponse(req);
       log('info', 'Build endpoint accessed', { method: req.method, url: req.url });
       
       if (req.method !== "POST") {
         log('warn', 'Invalid method used on build endpoint', { method: req.method });
-        return new Response(JSON.stringify({ 
+        return jsonResponse(req, { 
           success: false, 
           message: "Method not allowed. Use POST." 
-        }), {
-          status: 405,
-          headers: { "Content-Type": "application/json" }
-        });
+        }, 405);
       }
 
       try {
@@ -415,13 +446,10 @@ Bun.serve({
 
         if (!githubUrl) {
           log('error', 'GitHub URL missing in request body');
-          return new Response(JSON.stringify({ 
+          return jsonResponse(req, { 
             success: false, 
             message: "GitHub URL is required" 
-          }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" }
-          });
+          }, 400);
         }
 
         const buildId = generateBuildId();
@@ -432,13 +460,10 @@ Bun.serve({
         const cloned = await cloneRepository(githubUrl, buildId);
         if (!cloned) {
           log('error', 'Build failed at clone step', { buildId });
-          return new Response(JSON.stringify({ 
+          return jsonResponse(req, { 
             success: false, 
             message: "Failed to clone repository" 
-          }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
+          }, 500);
         }
 
         // Step 2: Build repository
@@ -447,13 +472,10 @@ Bun.serve({
         if (!built) {
           log('error', 'Build failed at build step, starting cleanup', { buildId });
           await cleanupBuild(buildId);
-          return new Response(JSON.stringify({ 
+          return jsonResponse(req, { 
             success: false, 
             message: "Failed to build repository" 
-          }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
+          }, 500);
         }
 
         // Step 3: Publish site
@@ -462,13 +484,10 @@ Bun.serve({
         if (!publishResult.ok) {
           log('error', 'Build failed at publish step, starting cleanup', { buildId });
           await cleanupBuild(buildId);
-          return new Response(JSON.stringify({ 
+          return jsonResponse(req, { 
             success: false, 
             message: "Failed to publish site" 
-          }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
+          }, 500);
         }
 
         // Step 4: Cleanup
@@ -508,20 +527,14 @@ Bun.serve({
 
         log('info', 'Build process completed successfully', response);
 
-        return new Response(JSON.stringify(response), {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        });
+        return jsonResponse(req, response, 200);
 
       } catch (error) {
         log('error', 'Unexpected error in build endpoint', { error: error instanceof Error ? error.message : error });
-        return new Response(JSON.stringify({ 
+        return jsonResponse(req, { 
           success: false, 
           message: "Internal server error" 
-        }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
+        }, 500);
       }
     }
   }

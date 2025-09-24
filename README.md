@@ -27,9 +27,9 @@ Server runs on `http://localhost:4836`
 
 Deploy a GitHub repository:
 ```bash
-curl -X POST http://localhost:4836/build \
+curl -X POST http://api.avenox.xyz/build \
   -H "Content-Type: application/json" \
-  -d '{"githubUrl": "https://github.com/username/repo"}'
+  -d '{"githubUrl": "https://github.com/ifeelsam/testsui"}'
 ```
 
 ## File Structure
@@ -67,3 +67,34 @@ MetroBuilder automatically detects build outputs in this order:
 - Bun runtime
 - site-builder CLI tool
 - Git
+
+
+server {
+    listen 80;
+    server_name api.avenox.xyz;
+    return 308 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.avenox.xyz;
+
+    ssl_certificate     /etc/letsencrypt/live/api.avenox.xyz/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.avenox.xyz/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:4836;  # FIXED
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+    }
+}
