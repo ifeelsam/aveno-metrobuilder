@@ -22,7 +22,7 @@ interface BuildResponse {
 
 // Configuration via environment variables
 const DOMAIN_BASE = process.env.AVENO_DOMAIN_BASE || "avenox.xyz";
-const PORTAL_MAP_PATH = process.env.AVENO_PORTAL_MAP_PATH || "/var/lib/avenox/portal.map";
+const PORTAL_MAP_PATH = process.env.AVENO_PORTAL_MAP_PATH || "/etc/nginx/portal.map";
 const NGINX_RELOAD = process.env.AVENO_NGINX_RELOAD === "1" || process.env.AVENO_NGINX_RELOAD === "true";
 
 // Generate unique build ID
@@ -92,8 +92,8 @@ async function readTextStream(stream: ReadableStream | null | undefined): Promis
   }
 }
 
-async function reloadNginxIfEnabled(): Promise<void> {
-  if (!NGINX_RELOAD) return;
+async function reloadNginxIfEnabled(force: boolean = false): Promise<void> {
+  if (!force && !NGINX_RELOAD) return;
   try {
     log('info', 'Reloading Nginx as per AVENO_NGINX_RELOAD');
     const testProc = spawn(["sudo", "nginx", "-t"], { stdio: ["inherit", "inherit", "inherit"] });
@@ -142,8 +142,6 @@ async function registerPortalMapping(repoName: string, portalUrl: string): Promi
   const tmpPath = `${PORTAL_MAP_PATH}.tmp-${Date.now()}`;
   await fs.writeFile(tmpPath, updated, { encoding: 'utf8' });
   await fs.rename(tmpPath, PORTAL_MAP_PATH);
-
-  await reloadNginxIfEnabled();
 
   log('info', 'Registered portal mapping', { publicHost, portalHost, mapPath: PORTAL_MAP_PATH });
   return { publicHost, portalHost, publicUrl };
@@ -492,6 +490,8 @@ Bun.serve({
             const reg = await registerPortalMapping(repoNameExtracted, portalUrl);
             publicHost = reg.publicHost;
             publicUrl = reg.publicUrl;
+            // Ensure Nginx picks up the change before responding
+            await reloadNginxIfEnabled(true);
           }
         } catch (e) {
           log('error', 'Failed to register portal mapping', { error: e instanceof Error ? e.message : e });
