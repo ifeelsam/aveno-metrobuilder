@@ -18,6 +18,7 @@ interface BuildResponse {
   portalUrl?: string;      // e.g. http://<slug>.localhost:3000
   publicHost?: string;     // e.g. <repo>.avenox.xyz
   publicUrl?: string;      // e.g. http(s)://<repo>.avenox.xyz
+  blobId?: string;         // e.g. 292xfyhlld7bahjr4hyvjqsdips66pvslabek0fr2m3ysmozwl
 }
 
 // Configuration via environment variables
@@ -85,11 +86,42 @@ async function ensureDirExistsForFile(filePath: string): Promise<void> {
 
 async function readTextStream(stream: ReadableStream | null | undefined): Promise<string> {
   if (!stream) return "";
-  // Bun supports Response on ReadableStream for easy text gathering
   try {
     return await new Response(stream).text();
   } catch {
     return "";
+  }
+}
+
+// Stream logs live to stdout/stderr while collecting for parsing
+async function streamAndCollect(
+  stream: ReadableStream | null | undefined,
+  write: (chunk: string) => void
+): Promise<string> {
+  if (!stream) return "";
+  let collected = "";
+  try {
+    // Try using a reader for chunked streaming
+    const reader = (stream as any).getReader ? (stream as any).getReader() : null;
+    if (!reader) {
+      const text = await new Response(stream).text();
+      write(text);
+      return text;
+    }
+    const decoder = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = typeof value === 'string' ? value : decoder.decode(value);
+      collected += text;
+      write(text);
+    }
+    return collected;
+  } catch {
+    // Fallback: read whole stream
+    const text = await new Response(stream).text();
+    write(text);
+    return text;
   }
 }
 
@@ -362,16 +394,23 @@ async function publishSite(buildId: string): Promise<{ ok: boolean; portalUrl?: 
     
     const publishProcess = spawn(siteBuilderCommand, {
       cwd: buildDir,
-      stdio: ["inherit", "pipe", "pipe"] // capture stdout/stderr to parse portal URL
+      stdio: ["inherit", "pipe", "pipe"] // stream logs while capturing to parse portal URL
     });
 
     log('info', 'Site-builder process spawned, waiting for completion...');
     
-    // Read outputs while process runs
+    // Stream outputs live and collect
+    const stdoutPromise = streamAndCollect((publishProcess as any).stdout, (t) => {
+      try { (process as any).stdout.write(t); } catch { console.log(t); }
+    });
+    const stderrPromise = streamAndCollect((publishProcess as any).stderr, (t) => {
+      try { (process as any).stderr.write(t); } catch { console.error(t); }
+    });
+    const exitCodePromise = publishProcess.exited;
     const [stdoutText, stderrText, exitCode] = await Promise.all([
-      readTextStream((publishProcess as any).stdout),
-      readTextStream((publishProcess as any).stderr),
-      publishProcess.exited
+      stdoutPromise,
+      stderrPromise,
+      exitCodePromise
     ]);
     
     if (exitCode === 0) {
@@ -499,6 +538,13 @@ Bun.serve({
         let publicUrl: string | undefined;
         let portalUrl: string | undefined = publishResult.portalUrl;
 
+        // Extract blob ID from portal URL for fallback
+        let blobId: string | undefined;
+        if (portalUrl) {
+          const match = portalUrl.match(/^https?:\/\/([a-z0-9]+)\.localhost:3000/);
+          blobId = match ? match[1] : undefined;
+        }
+
         try {
           const repoNameExtracted = extractRepoNameFromGitHubUrl(githubUrl);
           if (!repoNameExtracted) {
@@ -516,13 +562,29 @@ Bun.serve({
           log('error', 'Failed to register portal mapping', { error: e instanceof Error ? e.message : e });
         }
 
+        // If nginx mapping failed, create fallback URLs
+        if (!publicUrl && portalUrl) {
+          const repoNameExtracted = extractRepoNameFromGitHubUrl(githubUrl);
+          if (repoNameExtracted && blobId) {
+            // Create a clean public URL using the domain base and blob ID
+            publicHost = `${toSubdomain(repoNameExtracted)}.${DOMAIN_BASE}`;
+            publicUrl = `http://${publicHost}`;
+            log('info', 'Created fallback public URL', { publicHost, publicUrl, blobId });
+          } else if (blobId) {
+            // Fallback to just the blob ID URL
+            publicUrl = `https://wal.app/${blobId}`;
+            log('info', 'Created blob-based fallback URL', { publicUrl, blobId });
+          }
+        }
+
         const response: BuildResponse = {
           success: true,
           message: "Successfully built and published site",
           buildId,
           portalUrl,
           publicHost,
-          publicUrl
+          publicUrl,
+          blobId
         };
 
         log('info', 'Build process completed successfully', response);
