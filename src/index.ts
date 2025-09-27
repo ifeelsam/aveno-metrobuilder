@@ -1,11 +1,10 @@
 import { spawn } from "bun";
-import * as fs from "fs/promises";
-import { dirname } from "path";
-
-// Logging utility
-function log(level: string, message: string, data?: any) {
-  console.log(`[${level.toUpperCase()}] ${message}`, data ? JSON.stringify(data, null, 2) : '');
-}
+// (fs and path moved to services)
+import { DOMAIN_BASE } from "./config";
+import { log } from "./utils/log";
+import { handleDomains } from "./routes/domains";
+import { jsonResponse, preflightResponse } from "./routes/helpers";
+import { addOrEditMapping, toSubdomain } from "./services/portalMap";
 
 interface BuildRequest {
   githubUrl: string;
@@ -21,26 +20,11 @@ interface BuildResponse {
   blobId?: string;         // e.g. 292xfyhlld7bahjr4hyvjqsdips66pvslabek0fr2m3ysmozwl
 }
 
-// Configuration via environment variables
-const DOMAIN_BASE = process.env.AVENO_DOMAIN_BASE || "avenox.xyz";
-const PORTAL_MAP_PATH = process.env.AVENO_PORTAL_MAP_PATH || "/etc/nginx/portal.map";
-const NGINX_RELOAD = process.env.AVENO_NGINX_RELOAD === "1" || process.env.AVENO_NGINX_RELOAD === "true";
-const CORS_ORIGINS = process.env.AVENO_CORS_ORIGINS || "*"; // comma-separated or '*'
-
 // Generate unique build ID
 function generateBuildId(): string {
   const buildId = `build_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   log('info', 'Generated new build ID', { buildId });
   return buildId;
-}
-
-// Convert a string into a DNS-safe subdomain
-function toSubdomain(raw: string): string {
-  return raw
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$|\./g, "");
 }
 
 // Extract repo name from GitHub URL (supports HTTPS and SSH formats)
@@ -76,23 +60,6 @@ function parsePortalUrlFromOutput(output: string): string | null {
   return null;
 }
 
-async function ensureDirExistsForFile(filePath: string): Promise<void> {
-  try {
-    await fs.mkdir(dirname(filePath), { recursive: true });
-  } catch (error) {
-    // ignore EEXIST etc.
-  }
-}
-
-async function readTextStream(stream: ReadableStream | null | undefined): Promise<string> {
-  if (!stream) return "";
-  try {
-    return await new Response(stream).text();
-  } catch {
-    return "";
-  }
-}
-
 // Stream logs live to stdout/stderr while collecting for parsing
 async function streamAndCollect(
   stream: ReadableStream | null | undefined,
@@ -125,93 +92,7 @@ async function streamAndCollect(
   }
 }
 
-async function reloadNginxIfEnabled(force: boolean = false): Promise<void> {
-  if (!force && !NGINX_RELOAD) return;
-  try {
-    log('info', 'Reloading Nginx as per AVENO_NGINX_RELOAD');
-    const testProc = spawn(["sudo", "nginx", "-t"], { stdio: ["inherit", "inherit", "inherit"] });
-    const testExit = await testProc.exited;
-    if (testExit !== 0) {
-      log('error', 'nginx -t failed; skipping reload', { testExit });
-      return;
-    }
-    const reloadProc = spawn(["sudo", "systemctl", "reload", "nginx"], { stdio: ["inherit", "inherit", "inherit"] });
-    const reloadExit = await reloadProc.exited;
-    if (reloadExit !== 0) {
-      log('error', 'systemctl reload nginx failed', { reloadExit });
-    } else {
-      log('info', 'Nginx reloaded');
-    }
-  } catch (error) {
-    log('error', 'Failed to reload Nginx', { error: error instanceof Error ? error.message : error });
-  }
-}
-
-// CORS helpers
-function getCorsHeaders(req: Request): Record<string, string> {
-  const origin = req.headers.get("Origin");
-  const allowHeaders = req.headers.get("Access-Control-Request-Headers") || "Content-Type, Authorization";
-  const headers: Record<string, string> = {
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": allowHeaders,
-    "Access-Control-Max-Age": "86400",
-  };
-  if (CORS_ORIGINS === "*") {
-    headers["Access-Control-Allow-Origin"] = "*";
-  } else if (origin) {
-    const allowed = CORS_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
-    if (allowed.includes(origin)) {
-      headers["Access-Control-Allow-Origin"] = origin;
-      headers["Vary"] = "Origin";
-    }
-  }
-  return headers;
-}
-
-function jsonResponse(req: Request, body: any, status = 200): Response {
-  const baseHeaders = {
-    "Content-Type": "application/json",
-    ...getCorsHeaders(req),
-  };
-  return new Response(JSON.stringify(body), { status, headers: baseHeaders });
-}
-
-function preflightResponse(req: Request): Response {
-  return new Response(null, { status: 204, headers: getCorsHeaders(req) });
-}
-
-// Update /var/lib/avenox/portal.map with mapping: <repo>.<domainBase> <slug>.localhost;
-async function registerPortalMapping(repoName: string, portalUrl: string): Promise<{ publicHost: string; portalHost: string; publicUrl: string }> {
-  const repoSubdomain = toSubdomain(repoName);
-  if (!repoSubdomain) {
-    throw new Error("Invalid repo name after slugify");
-  }
-  const publicHost = `${repoSubdomain}.${DOMAIN_BASE}`;
-
-  const u = new URL(portalUrl);
-  if (u.hostname.endsWith('.localhost') === false || (u.port && u.port !== '3000')) {
-    throw new Error(`Unexpected portal URL host/port: ${u.hostname}:${u.port || ''}`);
-  }
-  const portalHost = u.hostname; // e.g. <slug>.localhost
-
-  const publicUrl = `http://${publicHost}`;
-
-  await ensureDirExistsForFile(PORTAL_MAP_PATH);
-
-  // Read existing map file (if any)
-  const current = await fs.readFile(PORTAL_MAP_PATH).then(b => b.toString('utf8')).catch(() => '');
-  const existingLines = current.split('\n').filter(line => line.trim().length > 0);
-  const filtered = existingLines.filter(line => !line.trimStart().startsWith(publicHost + ' '));
-  const updated = [...filtered, `${publicHost} ${portalHost};`].join('\n') + '\n';
-
-  // Atomic replace: write to temp in same dir then rename
-  const tmpPath = `${PORTAL_MAP_PATH}.tmp-${Date.now()}`;
-  await fs.writeFile(tmpPath, updated, { encoding: 'utf8' });
-  await fs.rename(tmpPath, PORTAL_MAP_PATH);
-
-  log('info', 'Registered portal mapping', { publicHost, portalHost, mapPath: PORTAL_MAP_PATH });
-  return { publicHost, portalHost, publicUrl };
-}
+// no-op
 
 // Clone GitHub repository
 async function cloneRepository(githubUrl: string, buildId: string): Promise<boolean> {
@@ -465,6 +346,8 @@ Bun.serve({
       });
     },
     
+    "/domains": handleDomains,
+
     "/build": async (req) => {
       if (req.method === "OPTIONS") return preflightResponse(req);
       log('info', 'Build endpoint accessed', { method: req.method, url: req.url });
@@ -552,11 +435,9 @@ Bun.serve({
           } else if (!portalUrl) {
             log('warn', 'No portal URL found in site-builder output; skipping portal map registration');
           } else {
-            const reg = await registerPortalMapping(repoNameExtracted, portalUrl);
+            const reg = await addOrEditMapping({ desiredSubdomain: repoNameExtracted, portalHostOrUrl: portalUrl });
             publicHost = reg.publicHost;
             publicUrl = reg.publicUrl;
-            // Ensure Nginx picks up the change before responding
-            await reloadNginxIfEnabled(true);
           }
         } catch (e) {
           log('error', 'Failed to register portal mapping', { error: e instanceof Error ? e.message : e });
